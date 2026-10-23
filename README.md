@@ -48,15 +48,16 @@ py -3.12 -m venv .venv
 ## 使用
 
 1. iPhone 接上 USB 並解鎖。
-2. 雙擊 **`Projector.bat`**（或執行 `.venv\Scripts\python app.py`）。
+2. 雙擊 **`Projector.pyw`**，不會開主控台視窗。需要看即時紀錄時，改用 `Projector-debug.bat`。
 3. 「Projector - iPhone」視窗出現畫面就可以用了。iPhone 轉成橫向時，視窗會跟著轉。
-4. 結束時**關閉 Projector 視窗**（不是主控台），程式會先讓 iPhone 正常結束擷取。
+4. 結束時**關閉 Projector 視窗**，程式會先讓 iPhone 正常結束擷取。
 
 擷取期間：
 - iPhone 狀態列會顯示「9:41、滿電」，動態島也會出現擷取提示，這些都是正常的。
 - 聲音改由電腦播放，iPhone 喇叭不會出聲，iPhone 的音量鍵也沒有作用。
 - 擷取一開始，YouTube 這類 App 會**自動暫停**，再按一次播放即可。
 - 拔掉 iPhone 後，視窗會顯示「等待 iPhone 連接」，接回去會自動重新連線。
+- 拖動視窗或調整大小時，畫面會停在當下，放開滑鼠就恢復；聲音不受影響。
 
 ### 調整音量
 
@@ -80,13 +81,14 @@ py -3.12 -m venv .venv
 | `--log 路徑` | 紀錄檔位置（預設 `out\app.log`） |
 | `--seconds N --screenshot 路徑` | 自我測試：收到畫面 N 秒後截圖並結束 |
 | `--libusb0-dll 路徑` | 指定 `libusb0.dll` 的位置（找不到時才需要） |
-| `-v`、`--verbose` | 主控台也顯示除錯訊息（紀錄檔一律包含） |
+| `-v`、`--verbose` | 主控台也顯示除錯訊息（用 `Projector-debug.bat` 時；紀錄檔一律包含） |
 
 ## 疑難排解
 
 | 狀況 | 處理方式 |
 |---|---|
 | 啟動時出現「找不到 libusb0.dll」 | 驅動還沒換成功。`libusb0.dll` 是 Zadig 安裝 libusb-win32 時放進系統的，請重做安裝步驟 1。如果 DLL 放在別的位置，用 `--libusb0-dll` 指定。 |
+| 雙擊後沒有出現視窗 | 出錯時會跳出對話框說明原因。沒有對話框的話，看 `out\app.log`，或改用 `Projector-debug.bat` 看主控台訊息。 |
 | 一直顯示「等待 iPhone 連接」 | 確認 USB 線有接好、iPhone 已解鎖，而且 Zadig 換的是整台 **iPhone**（見安裝步驟 1）。 |
 | 顯示「iPhone 沒有回應」 | iPhone 的擷取服務卡住了，通常是之前的擷取沒有正常結束。拔插沒有用，要**重開 iPhone**。 |
 | 有畫面但沒有聲音 | 先確認 iPhone 上的影片真的在播放（擷取開始時常被自動暫停）。如果還是沒聲音，可能是 iPhone 連線前的音量為 0：iPhone 送出來的就是靜音，Projector 再怎麼放大也聽不到。請拔掉 USB，把 iPhone 音量調高，再接上。 |
@@ -127,7 +129,8 @@ py -3.12 -m venv .venv
 
 | 路徑 | 用途 |
 |---|---|
-| `app.py`、`Projector.bat` | App：視窗、按鍵、狀態顯示 |
+| `app.py` | App：視窗、按鍵、狀態顯示 |
+| `Projector.pyw`、`Projector-debug.bat` | 啟動檔：不開主控台／開主控台（除錯用） |
 | `projector/capture.py` | 擷取引擎：連線順序、自動重連、正常結束 |
 | `projector/protocol.py` | 擷取協定：封包、握手、時鐘、畫面／聲音樣本解析 |
 | `projector/usb_transport.py` | 透過 libusb0 切換擷取模式並收送 USB 資料 |

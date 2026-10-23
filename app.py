@@ -45,15 +45,18 @@ log = logging.getLogger("app")
 def setup_logging(path: Path, verbose: bool) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)-7s %(name)s: %(message)s", "%H:%M:%S")
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(logging.DEBUG if verbose else logging.INFO)
-    console.setFormatter(fmt)
+    console = None
+    if sys.stdout is not None:  # pythonw.exe (no console) has no stdout
+        console = logging.StreamHandler(sys.stdout)
+        console.setLevel(logging.DEBUG if verbose else logging.INFO)
+        console.setFormatter(fmt)
     logfile = logging.FileHandler(path, "w", encoding="utf-8")
     logfile.setLevel(logging.DEBUG)
     logfile.setFormatter(fmt)
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
-    root.addHandler(console)
+    if console is not None:
+        root.addHandler(console)
     root.addHandler(logfile)
 
     def thread_hook(args):
@@ -186,7 +189,7 @@ class App:
 
         try:
             while True:
-                for event in pygame.event.get():
+                for event in self._pump_events(pygame):
                     if event.type == pygame.QUIT:
                         quitting = True
                     elif event.type == pygame.VIDEORESIZE:
@@ -254,11 +257,25 @@ class App:
             pygame.quit()
         return exit_code
 
+    @staticmethod
+    def _pump_events(pygame) -> list:
+        """Collect window events without stalling the other threads.
+
+        While the user drags or resizes the window, Windows runs its own message loop inside
+        SDL's event pump until the mouse is released. pygame.event.get() pumps while holding
+        the GIL, which froze USB reading, decoding and audio for the whole drag.
+        event.wait() pumps with the GIL released, so only drawing pauses during a drag.
+        """
+        first = pygame.event.wait(1)
+        events = [] if first.type == pygame.NOEVENT else [first]
+        events.extend(pygame.event.get(pump=False))
+        return events
+
     def _wait_engine(self, pygame, screen, font) -> None:
         self.status = cap.STOPPING
         end = time.monotonic() + 10.0
         while not self.engine_done.is_set() and time.monotonic() < end:
-            pygame.event.pump()
+            self._pump_events(pygame)
             self._draw(screen, font)
             pygame.display.flip()
             time.sleep(0.05)
@@ -386,7 +403,22 @@ def main() -> int:
         return App(args).run()
     except ut.UsbSetupError as e:
         log.error("%s", e)
+        show_error(str(e))
         return 1
+    except Exception as e:  # noqa: BLE001
+        log.exception("Projector 發生未預期的錯誤")
+        show_error(f"Projector 發生未預期的錯誤：\n{e}\n\n詳細紀錄在 {args.log}")
+        return 2
+
+
+def show_error(message: str) -> None:
+    """Without a console (pythonw), errors would vanish silently; show a dialog instead."""
+    if sys.stdout is not None:
+        return
+    try:
+        ctypes.windll.user32.MessageBoxW(None, message, "Projector", 0x10)  # MB_ICONERROR
+    except Exception:  # noqa: BLE001
+        pass
 
 
 if __name__ == "__main__":

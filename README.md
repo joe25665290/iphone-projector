@@ -25,8 +25,11 @@ Windows 預設的 Apple 驅動不允許 iPhone 切換到擷取模式，所以要
 3. 開 Zadig，選單 **Options**：
    - 勾選 **List All Devices**
    - **取消勾選** Ignore Hubs or Composite Parents
-4. 下拉選單選 **iPhone**（USB ID `05AC 12A8`，左邊 Driver 欄位是 `usbccgp`）。
+4. 下拉選單選 **iPhone**，確認：
+   - USB ID 前半是 `05AC`（Apple）。後半依機型而定，近年的 iPhone 通常是 `12A8`。
+   - 左邊 Driver 欄位是 `usbccgp`。這代表選到的是整台裝置，是最重要的判斷依據。
    - Zadig 顯示的是 iPhone 自己回報的名稱，不是裝置管理員裡的「Apple Mobile Device USB Composite Device」。
+   - iPhone 要在一般開機狀態。復原模式或 DFU 模式下 USB ID 會不同，不要換那個狀態的驅動。
    - 不要選 **Apple USB Multiplexor** 或 **PTP**。那是單一介面，只換其中一個切不了擷取模式。
    - 看不到 **iPhone** 的話，代表 Ignore Hubs or Composite Parents 還勾著。
 5. 右邊選 **libusb-win32**，按 **Replace Driver**。
@@ -76,11 +79,14 @@ py -3.12 -m venv .venv
 | `--serial 序號` | 接了多支 iPhone 時，指定要用哪一支 |
 | `--log 路徑` | 紀錄檔位置（預設 `out\app.log`） |
 | `--seconds N --screenshot 路徑` | 自我測試：收到畫面 N 秒後截圖並結束 |
+| `--libusb0-dll 路徑` | 指定 `libusb0.dll` 的位置（找不到時才需要） |
+| `-v`、`--verbose` | 主控台也顯示除錯訊息（紀錄檔一律包含） |
 
 ## 疑難排解
 
 | 狀況 | 處理方式 |
 |---|---|
+| 啟動時出現「找不到 libusb0.dll」 | 驅動還沒換成功。`libusb0.dll` 是 Zadig 安裝 libusb-win32 時放進系統的，請重做安裝步驟 1。如果 DLL 放在別的位置，用 `--libusb0-dll` 指定。 |
 | 一直顯示「等待 iPhone 連接」 | 確認 USB 線有接好、iPhone 已解鎖，而且 Zadig 換的是整台 **iPhone**（見安裝步驟 1）。 |
 | 顯示「iPhone 沒有回應」 | iPhone 的擷取服務卡住了，通常是之前的擷取沒有正常結束。拔插沒有用，要**重開 iPhone**。 |
 | 有畫面但沒有聲音 | 先確認 iPhone 上的影片真的在播放（擷取開始時常被自動暫停）。如果還是沒聲音，可能是 iPhone 連線前的音量為 0：iPhone 送出來的就是靜音，Projector 再怎麼放大也聽不到。請拔掉 USB，把 iPhone 音量調高，再接上。 |
@@ -109,19 +115,13 @@ py -3.12 -m venv .venv
 .venv\Scripts\python spike.py          # 收到畫面後錄 30 秒，輸出到 out\
 ```
 
-輸出 `video.h264`（原始畫面）、`audio.wav`（聲音）和 `spike.log`（完整紀錄）。成功時，最後會顯示「畫面 OK，聲音 OK」。
-
-`tools\bench_decode.py out\...\video.h264` 會把錄下來的畫面解出一張截圖，並測量各種顯示方式的速度。
-
-### 單元測試
-
-用真實封包樣本測試協定，不需要接手機：
+輸出 `video.h264`（原始畫面）、`audio.wav`（聲音）和 `spike.log`（完整紀錄）。成功時，最後會顯示「畫面 OK，聲音 OK」。用 `--seconds N` 可以改錄製秒數，`--out 資料夾` 可以改輸出位置。
 
 ```powershell
-.venv\Scripts\python -m unittest discover -s tests -v
+.venv\Scripts\python tools\bench_decode.py out\video.h264
 ```
 
-`tests/` 目前被 `.gitignore` 的 `test*` 規則排除，沒有納入版本控制。
+會把錄下來的畫面解出一張截圖（存成同一資料夾的 `screenshot.png`），並測量各種顯示方式的速度。
 
 ### 專案結構
 
@@ -139,10 +139,12 @@ py -3.12 -m venv .venv
 | `projector/sinks.py` | 測試腳本用：寫出 .h264／.wav 並統計 |
 | `spike.py` | 測試腳本 |
 | `tools/bench_decode.py` | 解碼速度測試 |
-| `tests/` | 協定單元測試（不在 git 裡） |
 
 ## 致謝
 
 協定移植自 [danielpaulus/quicktime_video_hack](https://github.com/danielpaulus/quicktime_video_hack)（MIT），
 並參考 [chotgpt/quicktime_video_hack_windows](https://github.com/chotgpt/quicktime_video_hack_windows)（MIT）的 Windows 做法。
-`tests/fixtures/qvh/` 裡的封包樣本來自 qvh，授權見同一資料夾的 `LICENSE-qvh`。
+
+## 授權
+
+本專案以 [MIT License](LICENSE) 釋出。移植自 qvh 的部分，其版權聲明見 [NOTICE](NOTICE)。

@@ -76,6 +76,39 @@ def set_dpi_aware() -> None:
             pass
 
 
+def keep_full_speed_in_background() -> None:
+    """Stop Windows from slowing Projector down while another app (Discord, OBS) is in front.
+
+    Windows 11 applies "EcoQoS" power throttling to background processes and, on hybrid CPUs
+    like the i7-12700H, prefers to run them on the efficiency cores. Live video can't afford
+    that, so opt out and raise the priority a little.
+    """
+    try:
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE  # pseudo-handle -1, must stay 64-bit
+        k32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.SetProcessInformation.restype = wintypes.BOOL
+        k32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k32.SetPriorityClass.restype = wintypes.BOOL
+
+        class PowerThrottlingState(ctypes.Structure):
+            _fields_ = [("Version", ctypes.c_ulong), ("ControlMask", ctypes.c_ulong),
+                        ("StateMask", ctypes.c_ulong)]
+
+        PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 0x1
+        ProcessPowerThrottling = 4
+        state = PowerThrottlingState(1, PROCESS_POWER_THROTTLING_EXECUTION_SPEED, 0)
+        ok = k32.SetProcessInformation(k32.GetCurrentProcess(), ProcessPowerThrottling,
+                                       ctypes.byref(state), ctypes.sizeof(state))
+        ABOVE_NORMAL_PRIORITY_CLASS = 0x8000
+        ok2 = k32.SetPriorityClass(k32.GetCurrentProcess(), ABOVE_NORMAL_PRIORITY_CLASS)
+        log.info("背景降速：%s，優先權：%s", "已關閉" if ok else "無法關閉", "高於標準" if ok2 else "未變更")
+    except Exception:  # noqa: BLE001
+        log.debug("could not change power throttling / priority", exc_info=True)
+
+
 class ConsoleCloseGuard:
     """When the console window is closed, give the capture a few seconds to stop cleanly."""
 
@@ -109,17 +142,23 @@ class App:
         volume = args.volume / 100 if args.volume is not None else self.settings.get("volume", 1.0)
         self.audio = AudioPlayer(args.audio_device, volume=volume)
         self.volume_shown_until = 0.0
+        self.dirty = True  # window needs a redraw
         self.engine = None
         self.streaming_since = None
         self.src_size = DEFAULT_SRC
         self.frame_seq = 0
         self.frame_surface = None
         self.displayed = 0
+        self.pipe_ms_max = 0.0   # USB arrival -> drawn, per stats period
+        self.pipe_ms_sum = 0.0
+        self.pipe_n = 0
+        self._last_decode_time = 0.0
 
     # -- capture side ----------------------------------------------------------
 
     def on_status(self, status: str, detail: str) -> None:
         self.status, self.status_detail = status, detail
+        self.dirty = True
         if status == cap.CONNECTING:
             self.decoder.reset()
             self.frame_surface = None
@@ -158,6 +197,7 @@ class App:
         import pygame
 
         set_dpi_aware()
+        keep_full_speed_in_background()
         os.environ.setdefault("SDL_HINT_WINDOWS_DPI_AWARENESS", "permonitorv2")
         pygame.display.init()
         pygame.font.init()
@@ -180,7 +220,7 @@ class App:
         engine_thread.start()
         ConsoleCloseGuard(self.stop, self.engine_done)
 
-        clock = pygame.time.Clock()
+        last_draw = 0.0
         last_stats = time.monotonic()
         last_counts = (0, 0, 0)
         shot_taken = False
@@ -194,6 +234,10 @@ class App:
                         quitting = True
                     elif event.type == pygame.VIDEORESIZE:
                         self.decoder.set_target(event.w, event.h)
+                        self.dirty = True
+                    elif event.type in (pygame.WINDOWEXPOSED, pygame.WINDOWRESTORED,
+                                        pygame.WINDOWSIZECHANGED):
+                        self.dirty = True
                     elif event.type == pygame.MOUSEWHEEL:
                         self._change_volume(0.1 * event.y)
                     elif event.type == pygame.KEYDOWN:
@@ -205,6 +249,7 @@ class App:
                             muted = self.audio.toggle_mute()
                             log.info("靜音 %s", "開" if muted else "關")
                             self.volume_shown_until = time.monotonic() + 1.5
+                            self.dirty = True
 
                 # Self-test: quit after N seconds of video.
                 if (self.args.seconds and self.streaming_since
@@ -219,6 +264,7 @@ class App:
                     log.info("關閉中，正在讓 iPhone 正常結束擷取")
                     self.stop.set()
                     self.status = cap.STOPPING
+                    self.dirty = True
                 if self.stop.is_set() and self.engine_done.is_set():
                     break
 
@@ -231,15 +277,26 @@ class App:
                     self.frame_surface = pygame.image.frombuffer(
                         frame.rgb, (frame.width, frame.height), "RGB")
                     self.displayed += 1
+                    if frame.t_arrival:
+                        ms = (time.perf_counter() - frame.t_arrival) * 1000
+                        self.pipe_ms_max = max(self.pipe_ms_max, ms)
+                        self.pipe_ms_sum += ms
+                        self.pipe_n += 1
+                    self.dirty = True
 
-                self._draw(screen, font)
-                pygame.display.flip()
-
+                # Redraw only when something changed. Redrawing the full window 120 times a
+                # second held the GIL and starved the decoder once Discord was also capturing it.
                 now = time.monotonic()
+                overlay = now <= self.volume_shown_until + 0.1
+                if self.dirty or overlay or now - last_draw >= 0.25:
+                    self._draw(screen, font)
+                    pygame.display.flip()
+                    self.dirty = False
+                    last_draw = now
+
                 if now - last_stats >= 5.0:
                     last_counts = self._log_stats(now - last_stats, last_counts)
                     last_stats = now
-                clock.tick(120)
         except KeyboardInterrupt:
             log.info("Ctrl+C，正在讓 iPhone 正常結束擷取")
             self.stop.set()
@@ -266,7 +323,7 @@ class App:
         the GIL, which froze USB reading, decoding and audio for the whole drag.
         event.wait() pumps with the GIL released, so only drawing pauses during a drag.
         """
-        first = pygame.event.wait(1)
+        first = pygame.event.wait(4)  # also the idle wait of the main loop (GIL released)
         events = [] if first.type == pygame.NOEVENT else [first]
         events.extend(pygame.event.get(pump=False))
         return events
@@ -297,6 +354,7 @@ class App:
             return
         volume = self.audio.set_volume(self.audio.volume + delta)
         self.volume_shown_until = time.monotonic() + 1.5
+        self.dirty = True
         self.settings["volume"] = volume
         settings.save(self.settings)
         log.info("音量 %d%%", round(volume * 100))
@@ -378,6 +436,20 @@ class App:
             d.backlog(), d.errors, a.buffered_ms(), a.output_latency_ms(), a.take_peak(),
             a.underruns, a.trims,
         )
+        e = self.engine
+        if e is not None:
+            log.info(
+                "延遲｜到達落後 +%.0f ms｜到達→顯示 平均 %.0f／最長 %.0f ms｜解碼排隊最長 %.0f ms"
+                "｜解碼忙碌 %.0f%%｜跳過 %d 張（%d 次）｜關鍵影格間隔最長 %.2f s｜USB 讀滿 %d/%d 次",
+                d.arrival_drift() * 1000,
+                self.pipe_ms_sum / self.pipe_n if self.pipe_n else 0.0, self.pipe_ms_max,
+                d.take_queue_wait_max() * 1000,
+                (d.decode_time - self._last_decode_time) / dt * 100, d.dropped, d.drop_events,
+                d.take_idr_gap_max(), e.usb_full_reads, e.usb_reads,
+            )
+            self._last_decode_time = d.decode_time
+            self.pipe_ms_max = self.pipe_ms_sum = 0.0
+            self.pipe_n = 0
         return rx, dec, shown
 
 

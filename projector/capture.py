@@ -97,6 +97,10 @@ class CaptureEngine:
         self.status = WAITING
         self.processor: Optional[p.MessageProcessor] = None
         self._framer: Optional[p.Framer] = None
+        # USB diagnostics: a read that fills the whole buffer means data was waiting (we're behind)
+        self.usb_reads = 0
+        self.usb_full_reads = 0
+        self.usb_bytes = 0
 
     def _set_status(self, status: str, detail: str = "") -> None:
         self.status = status
@@ -248,6 +252,10 @@ class CaptureEngine:
 
             try:
                 n = session.read_into(buf, 500)
+                self.usb_reads += 1
+                self.usb_bytes += n
+                if n == len(buf):
+                    self.usb_full_reads += 1
             except Exception as e:  # noqa: BLE001 - not a timeout: the phone went away
                 log.warning("USB 讀取中斷（iPhone 可能被拔掉）: %s", e)
                 return DISCONNECTED

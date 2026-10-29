@@ -16,17 +16,32 @@ import os
 import sys
 import threading
 import time
+import warnings
+from datetime import datetime
 from pathlib import Path
 
 from projector import capture as cap
 from projector import settings
 from projector import usb_transport as ut
+from projector import winutil
 from projector.audio import MAX_VOLUME, AudioPlayer, list_output_devices
-from projector.video import VideoDecoder, fit_size
+from projector.video import SCALE_FAST, SCALE_SHARP, VideoDecoder, fit_size
 
 TITLE = "Projector - iPhone"
 FONT_PATH = r"C:\Windows\Fonts\msjh.ttc"  # Microsoft JhengHei: has Traditional Chinese glyphs
 DEFAULT_SRC = (1180, 2556)
+
+HELP_LINES = [
+    ("上／下、+／-", "音量 ±10%"),
+    ("滾輪、Shift + 上／下", "音量 ±1%"),
+    ("M", "靜音"),
+    ("V", "畫面開／關"),
+    ("T", "視窗置頂"),
+    ("S", "截圖（存到「圖片\\Projector」）"),
+    ("D", "聲音改用 Windows 目前的預設裝置"),
+    ("Q", "畫質：清晰／快速"),
+    ("H、F1", "顯示／隱藏這個說明"),
+]
 
 STATUS_TEXT = {
     cap.WAITING: "等待 iPhone 連接…（USB 線接上並解鎖）",
@@ -142,6 +157,14 @@ class App:
         volume = args.volume / 100 if args.volume is not None else self.settings.get("volume", 1.0)
         self.audio = AudioPlayer(args.audio_device, volume=volume)
         self.volume_shown_until = 0.0
+        self.video_on = True
+        self.toast_text = ""
+        self.toast_until = 0.0
+        self.help_shown = False
+        self.on_top = bool(self.settings.get("always_on_top", False))
+        self.decoder.scale_method = SCALE_FAST if self.settings.get("scale") == "fast" else SCALE_SHARP
+        self.window = None  # pygame.Window of the display, for position and always-on-top
+        self.device_watch = None
         self.dirty = True  # window needs a redraw
         self.engine = None
         self.streaming_since = None
@@ -191,7 +214,22 @@ class App:
         import pygame
 
         desk_w, desk_h = pygame.display.get_desktop_sizes()[0]
+        saved = self.settings.get(self._size_key(src_w, src_h))
+        if isinstance(saved, list) and len(saved) == 2:
+            w, h = int(saved[0]), int(saved[1])
+            if 100 <= w <= desk_w * 2 and 100 <= h <= desk_h * 2:
+                return w, h
         return fit_size(src_w, src_h, int(desk_w * 0.9), int(desk_h * 0.85))
+
+    @staticmethod
+    def _size_key(src_w: int, src_h: int) -> str:
+        return "window_size_landscape" if src_w > src_h else "window_size_portrait"
+
+    def toast(self, text: str, seconds: float = 2.5) -> None:
+        """Short message at the bottom of the window (safe to call from any thread)."""
+        self.toast_text = text
+        self.toast_until = time.monotonic() + seconds
+        self.dirty = True
 
     def run(self) -> int:
         import pygame
@@ -207,8 +245,22 @@ class App:
             font = pygame.font.Font(None, 28)
 
         size = self.window_size_for(*self.src_size)
+        pos = self.settings.get("window_pos")
+        if isinstance(pos, list) and len(pos) == 2 and winutil.point_on_screen(pos[0] + 40, pos[1] + 10):
+            os.environ["SDL_VIDEO_WINDOW_POS"] = f"{int(pos[0])},{int(pos[1])}"
         screen = pygame.display.set_mode(size, pygame.RESIZABLE)
         pygame.display.set_caption(TITLE)
+        try:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                self.window = pygame.Window.from_display_module()
+        except Exception:  # noqa: BLE001
+            log.debug("no pygame.Window", exc_info=True)
+        if self.on_top:
+            self._apply_on_top()
+        if not self.args.audio_device:
+            self.device_watch = winutil.DefaultOutputWatcher(self._follow_default_output)
+            self.device_watch.start()
         # No text entry here: turn the input method off so letter keys (M) arrive as key presses
         # instead of being taken by a Chinese IME.
         pygame.key.stop_text_input()
@@ -234,21 +286,37 @@ class App:
                         quitting = True
                     elif event.type == pygame.VIDEORESIZE:
                         self.decoder.set_target(event.w, event.h)
+                        self.settings[self._size_key(*self.src_size)] = [event.w, event.h]
                         self.dirty = True
                     elif event.type in (pygame.WINDOWEXPOSED, pygame.WINDOWRESTORED,
                                         pygame.WINDOWSIZECHANGED):
                         self.dirty = True
                     elif event.type == pygame.MOUSEWHEEL:
-                        self._change_volume(0.1 * event.y)
+                        self._change_volume(0.01 * event.y)
                     elif event.type == pygame.KEYDOWN:
+                        # Shift + key: fine steps of 1%; plain key: 10%
+                        step = 0.01 if event.mod & pygame.KMOD_SHIFT else 0.1
                         if event.key in (pygame.K_UP, pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
-                            self._change_volume(0.1)
+                            self._change_volume(step)
                         elif event.key in (pygame.K_DOWN, pygame.K_MINUS, pygame.K_KP_MINUS):
-                            self._change_volume(-0.1)
+                            self._change_volume(-step)
                         elif event.key == pygame.K_m or event.scancode == pygame.KSCAN_M:
                             muted = self.audio.toggle_mute()
                             log.info("靜音 %s", "開" if muted else "關")
                             self.volume_shown_until = time.monotonic() + 1.5
+                            self.dirty = True
+                        elif event.key == pygame.K_v or event.scancode == pygame.KSCAN_V:
+                            self._toggle_video()
+                        elif event.key == pygame.K_t or event.scancode == pygame.KSCAN_T:
+                            self._toggle_on_top()
+                        elif event.key == pygame.K_s or event.scancode == pygame.KSCAN_S:
+                            self._screenshot()
+                        elif event.key == pygame.K_d or event.scancode == pygame.KSCAN_D:
+                            self._reopen_audio()
+                        elif event.key == pygame.K_q or event.scancode == pygame.KSCAN_Q:
+                            self._toggle_scale()
+                        elif event.key in (pygame.K_h, pygame.K_F1) or event.scancode == pygame.KSCAN_H:
+                            self.help_shown = not self.help_shown
                             self.dirty = True
 
                 # Self-test: quit after N seconds of video.
@@ -269,6 +337,9 @@ class App:
                     break
 
                 frame = self.decoder.take_latest(self.frame_seq)
+                if frame is not None and not self.video_on:
+                    self.frame_seq = frame.seq  # decoded just before it was turned off: ignore
+                    frame = None
                 if frame is not None:
                     self.frame_seq = frame.seq
                     if (frame.src_width, frame.src_height) != self.src_size:
@@ -287,7 +358,7 @@ class App:
                 # Redraw only when something changed. Redrawing the full window 120 times a
                 # second held the GIL and starved the decoder once Discord was also capturing it.
                 now = time.monotonic()
-                overlay = now <= self.volume_shown_until + 0.1
+                overlay = now <= max(self.volume_shown_until, self.toast_until) + 0.1
                 if self.dirty or overlay or now - last_draw >= 0.25:
                     self._draw(screen, font)
                     pygame.display.flip()
@@ -307,6 +378,9 @@ class App:
             self._wait_engine(pygame, screen, font)
             exit_code = 2
         finally:
+            self._save_window()
+            if self.device_watch is not None:
+                self.device_watch.stop()
             self.stop.set()
             engine_thread.join(10.0)
             self.decoder.stop()
@@ -348,6 +422,79 @@ class App:
             size = self.window_size_for(*self.src_size)
             pygame.display.set_mode(size, pygame.RESIZABLE)
             self.decoder.set_target(*size)
+            if self.on_top:
+                self._apply_on_top()
+
+    # -- keys ------------------------------------------------------------------------
+
+    def _apply_on_top(self) -> None:
+        try:
+            self.window.always_on_top = self.on_top
+        except Exception:  # noqa: BLE001
+            log.warning("無法設定視窗置頂", exc_info=True)
+
+    def _toggle_on_top(self) -> None:
+        self.on_top = not self.on_top
+        self._apply_on_top()
+        self.settings["always_on_top"] = self.on_top
+        settings.save(self.settings)
+        self.toast("視窗置頂：開" if self.on_top else "視窗置頂：關")
+
+    def _screenshot(self) -> None:
+        import pygame
+
+        rgb = self.decoder.snapshot() if self.video_on else None
+        if rgb is None:
+            self.toast("沒有畫面可以截圖")
+            return
+        folder = winutil.pictures_dir() / "Projector"
+        path = folder / f"iPhone_{datetime.now():%Y%m%d_%H%M%S}.png"
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            h, w = rgb.shape[:2]
+            pygame.image.save(pygame.image.frombuffer(rgb, (w, h), "RGB"), str(path))
+        except Exception as e:  # noqa: BLE001
+            log.exception("截圖失敗")
+            self.toast(f"截圖失敗：{e}")
+            return
+        log.info("截圖存到 %s", path)
+        self.toast(f"已截圖：{path.name}（{w}×{h}）")
+
+    def _reopen_audio(self) -> None:
+        try:
+            name = self.audio.reopen()
+        except Exception as e:  # noqa: BLE001
+            log.exception("切換聲音裝置失敗")
+            self.toast(f"切換聲音裝置失敗：{e}")
+            return
+        log.info("聲音輸出改為 %s", name)
+        self.toast(f"聲音輸出：{name}")
+
+    def _follow_default_output(self) -> None:
+        """Called from the device watcher thread when Windows' default playback device changes."""
+        self._reopen_audio()
+
+    def _toggle_scale(self) -> None:
+        sharp = self.decoder.scale_method != SCALE_SHARP
+        self.decoder.scale_method = SCALE_SHARP if sharp else SCALE_FAST
+        self.settings["scale"] = "sharp" if sharp else "fast"
+        settings.save(self.settings)
+        self.toast("畫質：清晰" if sharp else "畫質：快速（比較省 CPU）")
+
+    def _save_window(self) -> None:
+        try:
+            if self.window is not None:
+                self.settings["window_pos"] = list(self.window.position)
+        except Exception:  # noqa: BLE001
+            log.debug("could not read window position", exc_info=True)
+        settings.save(self.settings)
+
+    def _toggle_video(self) -> None:
+        self.video_on = not self.video_on
+        self.decoder.set_enabled(self.video_on)
+        self.frame_surface = None  # don't show a stale picture when it comes back
+        self.dirty = True
+        log.info("畫面 %s", "開" if self.video_on else "關（聲音照常）")
 
     def _change_volume(self, delta: float) -> None:
         if not delta:
@@ -394,11 +541,55 @@ class App:
         text = STATUS_TEXT.get(self.status, self.status)
         if self.status == cap.ERROR:
             text += self.status_detail
+        elif self.status == cap.STREAMING and not self.video_on:
+            text = "畫面已關閉，聲音照常播放（按 V 開啟）"
         elif self.status == cap.STREAMING and self.frame_surface is None:
             text = "等待畫面…"
-        if text:
+        if text and not self.help_shown:
             self._draw_text(screen, font, text, sw, sh)
         self._draw_volume(screen, font)
+        if time.monotonic() <= self.toast_until:
+            self._draw_toast(screen, font, self.toast_text)
+        if self.help_shown:
+            self._draw_help(screen, font)
+
+    @staticmethod
+    def _draw_toast(screen, font, text) -> None:
+        import pygame
+
+        sw, sh = screen.get_size()
+        surf = font.render(text, True, (240, 240, 240))
+        if surf.get_width() > sw - 32:  # narrow window: shrink rather than cut off
+            scale = (sw - 32) / surf.get_width()
+            surf = pygame.transform.smoothscale(
+                surf, (sw - 32, max(1, int(surf.get_height() * scale))))
+        box = pygame.Surface((surf.get_width() + 24, surf.get_height() + 12), pygame.SRCALPHA)
+        box.fill((0, 0, 0, 180))
+        x, y = (sw - box.get_width()) // 2, sh - box.get_height() - 24
+        screen.blit(box, (x, y))
+        screen.blit(surf, (x + 12, y + 6))
+
+    @staticmethod
+    def _draw_help(screen, font) -> None:
+        import pygame
+
+        sw, sh = screen.get_size()
+        keys = [font.render(k, True, (255, 210, 120)) for k, _ in HELP_LINES]
+        descs = [font.render(d, True, (235, 235, 235)) for _, d in HELP_LINES]
+        key_w = max(s.get_width() for s in keys)
+        line_h = font.get_linesize() + 6
+        w = key_w + 24 + max(s.get_width() for s in descs) + 40
+        h = line_h * len(HELP_LINES) + 32
+        panel = pygame.Surface((w, h), pygame.SRCALPHA)
+        panel.fill((0, 0, 0, 200))
+        for i, (k, d) in enumerate(zip(keys, descs)):
+            y = 16 + i * line_h
+            panel.blit(k, (20, y))
+            panel.blit(d, (20 + key_w + 24, y))
+        if w > sw - 16 or h > sh - 16:  # small window: shrink the whole panel to fit
+            scale = min((sw - 16) / w, (sh - 16) / h)
+            panel = pygame.transform.smoothscale(panel, (max(1, int(w * scale)), max(1, int(h * scale))))
+        screen.blit(panel, ((sw - panel.get_width()) // 2, (sh - panel.get_height()) // 2))
 
     @staticmethod
     def _draw_text(screen, font, text, sw, sh) -> None:

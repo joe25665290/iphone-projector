@@ -32,6 +32,10 @@ MAX_AGE = 0.3          # a sample that waited longer than this in the queue mean
 MAX_DROP_TIME = 1.5    # give up waiting for a keyframe after this long and decode anyway
 CONVERT_EVERY = 1 / 60  # while behind, convert to RGB at most this often (display rate)
 
+# Scaling to the window size. Measured on a 1180x2556 frame: BILINEAR 2-5 ms, LANCZOS 4-9 ms.
+SCALE_SHARP = "LANCZOS"   # crisper text
+SCALE_FAST = "BILINEAR"   # cheaper, slightly softer
+
 # Debug: pretend decoding is slow (ms per frame) to exercise the catch-up path.
 SLOW_DECODE_MS = float(os.environ.get("PROJECTOR_SLOW_DECODE_MS", "0") or 0)
 
@@ -68,6 +72,8 @@ class VideoDecoder:
         self._pending: deque = deque()  # items taken back out of the queue while skipping ahead
         self._lock = threading.Lock()
         self._latest: Optional[DisplayFrame] = None
+        self._raw = None  # newest decoded frame at full size (for screenshots)
+        self.scale_method = SCALE_SHARP
         self._target = (590, 1278)
         self._ctx = None
         self._avcc: Optional[bytes] = None
@@ -91,6 +97,7 @@ class VideoDecoder:
         self.idr_gap_max = 0.0                # longest time between keyframes since last read (s)
         self._dropping_since: Optional[float] = None
         self._last_convert = 0.0
+        self._video_off = False  # worker thread only; changed through the queue
 
     def start(self) -> None:
         self._thread.start()
@@ -147,6 +154,10 @@ class VideoDecoder:
         self._dropping_since = None
         self._q.put(("reset", None))
 
+    def set_enabled(self, on: bool) -> None:
+        """Turn decoding off (saves CPU while the picture is hidden) or back on."""
+        self._q.put(("enable", on))
+
     # -- consumer side (UI thread) --------------------------------------------
 
     def set_target(self, width: int, height: int) -> None:
@@ -159,6 +170,14 @@ class VideoDecoder:
         if f is not None and f.seq > after_seq:
             return f
         return None
+
+    def snapshot(self) -> Optional[np.ndarray]:
+        """Newest picture at the phone's full resolution, as (h, w, 3) RGB."""
+        with self._lock:
+            raw = self._raw
+        if raw is None:
+            return None
+        return np.ascontiguousarray(raw.reformat(format="rgb24").to_ndarray())
 
     def backlog(self) -> int:
         return self._q.qsize() + len(self._pending)
@@ -185,14 +204,28 @@ class VideoDecoder:
                     if payload != self._avcc:
                         self._open(payload)
                 elif kind == "reset":
+                    with self._lock:
+                        self._raw = None
                     self._ctx = None
                     self._avcc = None
+                elif kind == "enable":
+                    self._set_enabled(payload)
                 elif kind == "sample" and self._ctx is not None:
                     self._handle_sample(*payload)
             except Exception:  # noqa: BLE001
                 self.errors += 1
                 if self.errors <= 5 or self.errors % 100 == 0:
                     log.exception("解碼失敗（第 %d 次）", self.errors)
+
+    def _set_enabled(self, on: bool) -> None:
+        if on and self._video_off:
+            # Frames depend on earlier ones we skipped: resume from the next keyframe
+            # (one every ~0.5 s), the same way catching up does.
+            self._dropping_since = time.perf_counter()
+        self._video_off = not on
+        if not on:
+            with self._lock:
+                self._raw = None  # so a screenshot never shows a picture from before
 
     def _handle_sample(self, data: bytes, t_put: float, idr: bool) -> None:
         """Decode one sample, or drop it if we're too far behind.
@@ -202,6 +235,8 @@ class VideoDecoder:
         has waited longer than MAX_AGE, drop everything up to the next keyframe; this bounds
         the delay instead of letting the queue grow without end.
         """
+        if self._video_off:
+            return
         now = time.perf_counter()
         age = now - t_put
         self.queue_wait_max = max(self.queue_wait_max, age)
@@ -254,6 +289,8 @@ class VideoDecoder:
         frames = self._ctx.decode(av.Packet(data))
         for frame in frames:
             self.decoded += 1
+            with self._lock:
+                self._raw = frame
             # While more samples are waiting, skip the RGB conversion for frames that would
             # be replaced before the screen could show them anyway.
             now = time.perf_counter()
@@ -263,7 +300,7 @@ class VideoDecoder:
             with self._lock:
                 box_w, box_h = self._target
             w, h = fit_size(frame.width, frame.height, box_w, box_h)
-            rgb = frame.reformat(width=w, height=h, format="rgb24", interpolation="BILINEAR").to_ndarray()
+            rgb = frame.reformat(width=w, height=h, format="rgb24", interpolation=self.scale_method).to_ndarray()
             rgb = np.ascontiguousarray(rgb)
             self._seq += 1
             df = DisplayFrame(rgb, w, h, frame.width, frame.height, self._seq, t_arrival)

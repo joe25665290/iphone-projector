@@ -594,6 +594,11 @@ class MessageProcessor:
         self.releases = 0
         self.release_event = threading.Event()
         self.counts: dict[str, int] = {}
+        # Ending from the phone side ("Stop Screen Mirroring" in Control Center)
+        self.host_stopping = False                # we sent HPA0/HPD0
+        self.device_released = False              # RELS arrived without us asking
+        self.video_stop_at: Optional[float] = None  # phone sent STOP for a non-audio stream
+        self.last_feed_at: Optional[float] = None
 
     def _count(self, name: str) -> None:
         self.counts[name] = self.counts.get(name, 0) + 1
@@ -688,6 +693,8 @@ class MessageProcessor:
             which = "audio" if self.local_audio_clock and clock_ref == self.local_audio_clock.id else "stream"
             log.info("Device sent STOP for %s (clockRef %x); continuing", which, clock_ref)
             self._count("stop-" + which)
+            if which != "audio":
+                self.video_stop_at = time.monotonic()
             if which == "audio" and SKEW_GUARD:
                 # Audio pauses with playback; measure skew afresh when it resumes.
                 self._reset_audio_timing()
@@ -701,6 +708,7 @@ class MessageProcessor:
         self._count("asyn-" + name)
 
         if subtype == FEED:
+            self.last_feed_at = time.monotonic()
             try:
                 sb = SampleBuffer.parse(frame[16:], MEDIA_VIDEO)
             except (ProtocolError, struct.error) as e:
@@ -735,6 +743,9 @@ class MessageProcessor:
             self.releases += 1
             self.release_event.set()
             log.info("RELS received (%d)", self.releases)
+            if not self.host_stopping and not self.device_released:
+                self.device_released = True
+                log.warning("iPhone 自行結束擷取（RELS，clockRef %x）", struct.unpack_from("<Q", frame, 4)[0])
         elif subtype in (SPRP, TJMP, SRAT, TBAS):
             log.debug("ASYN %s", name)
         else:
@@ -750,6 +761,17 @@ class MessageProcessor:
         dev = pts.seconds() - self._audio_last_dev.seconds() if pts.scale and self._audio_last_dev.scale else local
         return abs(local - dev) > 0.5
 
+    def device_ended(self, grace: float = 3.0) -> bool:
+        """True once the phone has ended the session on its own: it released the stream, or it
+        stopped the video stream and sent no picture for `grace` seconds afterwards."""
+        if self.device_released:
+            return True
+        stop_at = self.video_stop_at
+        if stop_at is None or time.monotonic() - stop_at < grace:
+            return False
+        return self.last_feed_at is None or self.last_feed_at < stop_at
+
     def stop_packets(self) -> list[bytes]:
         """Packets that ask the phone to stop streaming. Keep reading afterwards to see RELS."""
+        self.host_stopping = True
         return [asyn_hpa0(self.device_audio_clock_ref), asyn_hpd0()]

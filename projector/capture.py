@@ -36,6 +36,7 @@ CONNECTING = "connecting"    # trust + switch in progress
 STREAMING = "streaming"      # samples arriving
 STOPPING = "stopping"
 STUCK = "stuck"              # phone never answered: needs a restart
+ENDED = "ended"              # the phone stopped mirroring (Control Center); wait for the user
 DISCONNECTED = "disconnected"
 ERROR = "error"
 STOPPED = "stopped"
@@ -101,6 +102,7 @@ class CaptureEngine:
         self.usb_reads = 0
         self.usb_full_reads = 0
         self.usb_bytes = 0
+        self.resume = threading.Event()  # set by the app to start again after ENDED
 
     def _set_status(self, status: str, detail: str = "") -> None:
         self.status = status
@@ -115,30 +117,51 @@ class CaptureEngine:
 
     def run_forever(self, stop: threading.Event, poll: float = 1.5) -> None:
         """Wait for the phone, stream until it goes away, repeat. Returns when `stop` is set."""
+        stuck_retried = False
         while not stop.is_set():
             dev = ut.find_by_serial(self.backend, self.serial)
             if dev is None:
                 if self.status != WAITING:
                     self._set_status(WAITING)
+                stuck_retried = False
                 stop.wait(poll)
                 continue
             result = self.run_once(stop)
             if stop.is_set():
                 break
-            if result.status in (STUCK, ERROR):
-                # Don't hammer the phone; wait until it disappears (unplug / restart) first.
-                self._wait_until_gone(stop, poll)
+            if result.status == STUCK and not stuck_retried:
+                # The teardown just switched the phone back to normal and reset it; that is
+                # sometimes enough for its capture service to recover. Try once more.
+                stuck_retried = True
+                log.warning("iPhone 沒有回應，重設後再試一次")
+                stop.wait(3.0)
+                continue
+            if result.status in (ENDED, STUCK, ERROR):
+                # ENDED: the user stopped mirroring on the phone, so don't restart it by ourselves.
+                # STUCK/ERROR: don't hammer the phone.
+                # Either way wait for an unplug, or for the user to ask again (R key).
+                self.resume.clear()
+                self._wait_until_gone(stop, poll, self.resume)
+                stuck_retried = False
             else:
+                stuck_retried = False
                 stop.wait(poll)
         self._set_status(STOPPED)
 
-    def _wait_until_gone(self, stop: threading.Event, poll: float) -> None:
+    def _wait_until_gone(self, stop: threading.Event, poll: float,
+                         resume: Optional[threading.Event] = None) -> None:
+        """Wait until the phone is unplugged (or `resume` is set)."""
         serial = self.serial
         while not stop.is_set():
+            if resume is not None and resume.is_set():
+                return
             dev = ut.find_by_serial(self.backend, serial)
             if dev is None:
                 return
-            stop.wait(poll)
+            if resume is not None:
+                resume.wait(poll)
+            else:
+                stop.wait(poll)
 
     # -- one capture session ----------------------------------------------------
 
@@ -183,6 +206,8 @@ class CaptureEngine:
             self._set_status(ERROR, result.error)
         elif result.status == DISCONNECTED:
             self._set_status(DISCONNECTED)
+        elif result.status == ENDED:
+            self._set_status(ENDED)
         return result
 
     def _setup(self, session: ut.CaptureSession, state: dict) -> None:
@@ -249,6 +274,9 @@ class CaptureEngine:
             if not mp.ping_received and now - opened_at > PING_TIMEOUT:
                 log.error("切換後 %.0f 秒沒有收到 PING：iPhone 的擷取服務可能卡住了", PING_TIMEOUT)
                 return STUCK
+            if mp.device_ended():
+                log.warning("iPhone 已停止螢幕鏡像，正常結束這次擷取")
+                return ENDED
 
             try:
                 n = session.read_into(buf, 500)

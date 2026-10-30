@@ -40,7 +40,7 @@ HELP_LINES = [
     ("S", "截圖（存到「圖片\\Projector」）"),
     ("D", "聲音改用 Windows 目前的預設裝置"),
     ("Q", "畫質：清晰／快速"),
-    ("R", "重新連線（iPhone 停止鏡像或沒有回應時）"),
+    ("R", "出錯後重新連線"),
     ("H、F1", "顯示／隱藏這個說明"),
 ]
 
@@ -49,8 +49,9 @@ STATUS_TEXT = {
     cap.CONNECTING: "連線中…",
     cap.STREAMING: "",
     cap.STOPPING: "正在結束…",
-    cap.STUCK: "iPhone 沒有回應。按 R 再試一次；還是不行就重開 iPhone",
-    cap.ENDED: "iPhone 已停止螢幕鏡像。按 R 重新投影，或重新插拔 USB",
+    cap.STUCK: "iPhone 沒有回應，請重開 iPhone 後再接上",
+    cap.ENDED: ("iPhone 已停止螢幕鏡像，要重開 iPhone 才能再投影。\n"
+                "下次想暫停請按 V，想結束請直接關閉這個視窗"),
     cap.DISCONNECTED: "iPhone 已中斷連線",
     cap.ERROR: "發生錯誤：",
     cap.STOPPED: "已停止",
@@ -479,7 +480,7 @@ class App:
         self._reopen_audio()
 
     def _reconnect(self) -> None:
-        if self.engine is None or self.status not in (cap.ENDED, cap.STUCK, cap.ERROR):
+        if self.engine is None or self.status != cap.ERROR:
             return
         log.info("使用者要求重新連線")
         self.engine.resume.set()

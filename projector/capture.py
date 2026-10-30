@@ -117,34 +117,24 @@ class CaptureEngine:
 
     def run_forever(self, stop: threading.Event, poll: float = 1.5) -> None:
         """Wait for the phone, stream until it goes away, repeat. Returns when `stop` is set."""
-        stuck_retried = False
         while not stop.is_set():
             dev = ut.find_by_serial(self.backend, self.serial)
             if dev is None:
                 if self.status != WAITING:
                     self._set_status(WAITING)
-                stuck_retried = False
                 stop.wait(poll)
                 continue
             result = self.run_once(stop)
             if stop.is_set():
                 break
-            if result.status == STUCK and not stuck_retried:
-                # The teardown just switched the phone back to normal and reset it; that is
-                # sometimes enough for its capture service to recover. Try once more.
-                stuck_retried = True
-                log.warning("iPhone 沒有回應，重設後再試一次")
-                stop.wait(3.0)
-                continue
             if result.status in (ENDED, STUCK, ERROR):
-                # ENDED: the user stopped mirroring on the phone, so don't restart it by ourselves.
-                # STUCK/ERROR: don't hammer the phone.
-                # Either way wait for an unplug, or for the user to ask again (R key).
+                # ENDED/STUCK: on iOS 18 the capture service doesn't come back after "Stop Screen
+                # Mirroring" until the phone restarts (resets and retries were tried; none helped).
+                # ERROR: don't hammer the phone.
+                # Wait for an unplug/restart, or for the user to ask again (R key).
                 self.resume.clear()
                 self._wait_until_gone(stop, poll, self.resume)
-                stuck_retried = False
             else:
-                stuck_retried = False
                 stop.wait(poll)
         self._set_status(STOPPED)
 

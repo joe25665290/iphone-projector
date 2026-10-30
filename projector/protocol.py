@@ -599,6 +599,7 @@ class MessageProcessor:
         self.device_released = False              # RELS arrived without us asking
         self.video_stop_at: Optional[float] = None  # phone sent STOP for a non-audio stream
         self.last_feed_at: Optional[float] = None
+        self.last_packet_at: Optional[float] = None
 
     def _count(self, name: str) -> None:
         self.counts[name] = self.counts.get(name, 0) + 1
@@ -607,6 +608,7 @@ class MessageProcessor:
         if len(frame) < 4:
             log.warning("ignoring %d-byte frame", len(frame))
             return
+        self.last_packet_at = time.monotonic()
         magic = struct.unpack_from("<I", frame, 0)[0]
         if magic == PING:
             self._count("ping")
@@ -762,9 +764,15 @@ class MessageProcessor:
         return abs(local - dev) > 0.5
 
     def device_ended(self, grace: float = 3.0) -> bool:
-        """True once the phone has ended the session on its own: it released the stream, or it
-        stopped the video stream and sent no picture for `grace` seconds afterwards."""
+        """True once the phone has ended the session on its own: it released the stream, it
+        stopped the video stream and sent no picture for `grace` seconds afterwards, or it went
+        completely silent. Seen on iOS 18 after "Stop Screen Mirroring": sometimes a RELS,
+        sometimes no message at all (then it drops USB ~35 s later and stays stuck)."""
         if self.device_released:
+            return True
+        if (self.last_feed_at is not None and self.last_packet_at is not None
+                and time.monotonic() - self.last_packet_at >= grace):
+            log.warning("iPhone 已 %.1f 秒沒有傳送任何資料", time.monotonic() - self.last_packet_at)
             return True
         stop_at = self.video_stop_at
         if stop_at is None or time.monotonic() - stop_at < grace:
